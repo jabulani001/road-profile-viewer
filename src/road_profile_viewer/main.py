@@ -4,8 +4,8 @@ Route Analyzer - Höhenprofil, Kalorien & Kraftstoffverbrauch
 
 import base64
 import math
-import xml.etree.ElementTree as ET
 
+import defusedxml.ElementTree as ET
 import numpy as np
 from dash import Dash, html, dcc, Input, Output, State, ctx
 import plotly.graph_objects as go
@@ -47,7 +47,11 @@ def parse_gpx(xml_string):
         except (TypeError, ValueError):
             continue
         ele_el = pt.find(f'{prefix}ele')
-        eles.append(float(ele_el.text) if ele_el is not None else 0.0)
+        try:
+            ele = float(ele_el.text) if ele_el is not None else 0.0
+        except (TypeError, ValueError):
+            ele = 0.0
+        eles.append(ele)
         lats.append(lat)
         lons.append(lon)
 
@@ -202,9 +206,13 @@ def load_route(contents, n_clicks, filename):
     if contents is None:
         return None, ""
 
-    _, content_string = contents.split(',')
-    xml_bytes = base64.b64decode(content_string)
-    result = parse_gpx(xml_bytes.decode('utf-8', errors='replace'))
+    try:
+        _, content_string = contents.split(',', 1)
+        xml_bytes = base64.b64decode(content_string)
+        result = parse_gpx(xml_bytes.decode('utf-8', errors='replace'))
+    except Exception:
+        return None, "Fehler beim Lesen der GPX Datei."
+
     if result is None:
         return None, "Fehler beim Lesen der GPX Datei."
     eles, distances, lats, lons = result
@@ -239,7 +247,7 @@ def update_charts(data, mode, weight, speed, fuel_base):
     lats = data.get('lats', [])
     lons = data.get('lons', [])
     gain, loss = elevation_stats(eles)
-    total_km = distances[-1]
+    total_km = max(distances[-1], 0.001)
 
     # Elevation chart
     elev_fig = go.Figure()
