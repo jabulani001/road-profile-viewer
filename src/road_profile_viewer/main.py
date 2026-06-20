@@ -1,387 +1,292 @@
 """
-Road Profile Viewer - Interactive 2D Visualization
-===================================================
-This module contains the entire application in a single file (intentionally monolithic 
-for educational purposes). It creates an interactive Dash application that visualizes:
-- A road profile represented by a clothoid-like curve
-- A camera mounted at position (0, 1.5)
-- A ray from the camera that can be rotated by the user
-- The intersection point between the ray and the road profile
-- Distance information on hover
+Route Analyzer - Höhenprofil, Kalorien & Kraftstoffverbrauch
 """
 
+import base64
+import math
+import xml.etree.ElementTree as ET
+
 import numpy as np
-from dash import Dash, html, dcc, Input, Output
+from dash import Dash, html, dcc, Input, Output, State, ctx
 import plotly.graph_objects as go
-import sys,os  # PEP8 Violation: Multiple imports on one line
 
 
-# =============================================================================
-# ROAD PROFILE GENERATION
-# =============================================================================
+# ─────────────────────────────────────────────────────────────
+# GPX PARSING
+# ─────────────────────────────────────────────────────────────
 
-def generate_road_profile(num_points=100,x_max=80):  # PEP8 Violation: Missing space after comma
-    """
-    Generate a road profile using a clothoid-like approximation.
-    
-    A clothoid (Euler spiral) is a curve whose curvature increases linearly 
-    with its arc length. We'll approximate this with a polynomial curve.
-    
-    Parameters:
-    -----------
-    num_points : int
-        Number of points to generate
-    x_max : float
-        Maximum x-coordinate value
-        
-    Returns:
-    --------
-    tuple of (np.array, np.array)
-        x and y coordinates of the road profile
-    """
-    # Generate equidistant x points from 0 to x_max
-    x = np.linspace(0, x_max, num_points)
-    
-    # Create a clothoid-like curve using a combination of polynomial and sinusoidal terms
-    # This creates a road that starts flat and gradually curves
-    # Normalize x for the calculation
-    x_norm = x / x_max
-    
-    # Clothoid approximation: starts flat, gradually increases curvature
-    # Scale to keep maximum height around 8m (realistic road profile)
-    y=0.015 * x_norm**3 * x_max + 0.3 * np.sin(2 * np.pi * x_norm) + 0.035 * x_norm * x_max  # PEP8 Violation: Missing space around =
-    
-    # Ensure it starts at (0, 0)
-    y = y - y[0]
-    
-    return x,y  # PEP8 Violation: Missing space after comma
+def haversine(lat1, lon1, lat2, lon2):
+    """Distanz zwischen zwei GPS-Koordinaten in km."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin((phi2 - phi1) / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2)
+         * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# =============================================================================
-# CAMERA AND RAY CALCULATIONS
-# =============================================================================
+def parse_gpx(xml_string):
+    """GPX-XML parsen, gibt (eles, distances_km) zurück oder None."""
+    try:
+        root = ET.fromstring(xml_string)
+    except ET.ParseError:
+        return None
 
-def calculate_ray_line(angle_degrees, camera_x=0, camera_y=2.0, x_max=80):
-    """
-    Calculate the line representing the camera ray.
-    
-    Parameters:
-    -----------
-    angle_degrees : float
-        Angle in degrees from the positive x-axis (measured downward from horizontal)
-    camera_x : float
-        X-coordinate of camera position
-    camera_y : float
-        Y-coordinate of camera position
-    x_max : float
-        Maximum x extent for the ray
-        
-    Returns:
-    --------
-    tuple of (np.array, np.array)
-        x and y coordinates of the ray line
-    """
-    # Convert angle to radians (angle is measured downward from horizontal)
-    # Negative angle because y-axis points up but we measure downward angle
-    angle_rad = -np.deg2rad(angle_degrees)
-    
-    # Calculate slope
-    if np.abs(np.cos(angle_rad)) < 1e-10:
-        # Vertical line case
-        return np.array([camera_x, camera_x]), np.array([camera_y, -10])
-    
-    slope = np.tan(angle_rad)
-    
-    # Calculate x range where the ray is valid
-    # The ray should extend from the camera to where it would intersect y=0 or beyond
-    if angle_degrees < 0 or angle_degrees > 180:
-        # Ray going upward - just show a short segment
-        x_end = min(camera_x + 20, x_max)
-    else:
-        # Ray going downward - extend to x_max
-        x_end = x_max
-    
-    # Generate points for the ray
-    x_ray = np.array([camera_x, x_end])
-    y_ray = camera_y + slope * (x_ray - camera_x)
-    
-    return x_ray, y_ray
+    ns_match = root.tag.split('}')[0].lstrip('{') if '}' in root.tag else ''
+    prefix = f'{{{ns_match}}}' if ns_match else ''
 
+    trkpts = root.findall(f'.//{prefix}trkpt')
+    if not trkpts:
+        return None
 
-def find_intersection(x_road, y_road, angle_degrees, camera_x=0, camera_y=1.5):
-    """
-    Find the intersection point between the camera ray and the road profile.
-    
-    Parameters:
-    -----------
-    x_road : np.array
-        X-coordinates of the road profile
-    y_road : np.array
-        Y-coordinates of the road profile
-    angle_degrees : float
-        Angle of the camera ray in degrees
-    camera_x : float
-        X-coordinate of camera position
-    camera_y : float
-        Y-coordinate of camera position
-        
-    Returns:
-    --------
-    tuple of (float, float, float) or (None, None, None)
-        x, y coordinates of intersection and distance from camera, or None if no intersection
-    """
-    angle_rad = -np.deg2rad(angle_degrees)
-    
-    # Handle vertical ray
-    if np.abs(np.cos(angle_rad)) < 1e-10:
-        return None, None, None
-    
-    slope = np.tan(angle_rad)
-    
-    # Ray equation: y = camera_y + slope * (x - camera_x)
-    # Check each segment of the road for intersection
-    for i in range(len(x_road) - 1):
-        x1, y1 = x_road[i], y_road[i]
-        x2, y2 = x_road[i + 1], y_road[i + 1]
-        
-        # Skip if this segment is behind the camera
-        if x2 <= camera_x:
+    lats, lons, eles = [], [], []
+    for pt in trkpts:
+        try:
+            lat = float(pt.get('lat'))
+            lon = float(pt.get('lon'))
+        except (TypeError, ValueError):
             continue
-        
-        # Calculate y values of the ray at x1 and x2
-        ray_y1 = camera_y + slope * (x1 - camera_x)
-        ray_y2 = camera_y + slope * (x2 - camera_x)
-        
-        # Check if the ray crosses the road segment
-        # The ray intersects if it's on different sides of the road at x1 and x2
-        diff1 = ray_y1 - y1
-        diff2 = ray_y2 - y2
-        
-        if diff1 * diff2 <= 0:  # Sign change or zero indicates intersection
-            # Linear interpolation to find exact intersection point
-            if abs(diff2 - diff1) < 1e-10:
-                # Parallel lines
-                t = 0
-            else:
-                t = diff1 / (diff1 - diff2)
-            
-            # Interpolate to find intersection point
-            x_intersect = x1 + t * (x2 - x1)
-            y_intersect = y1 + t * (y2 - y1)
-            
-            # Calculate distance from camera to intersection
-            distance = np.sqrt((x_intersect - camera_x)**2 + (y_intersect - camera_y)**2)
-            
-            return x_intersect, y_intersect, distance
-    
-    return None, None, None
+        ele_el = pt.find(f'{prefix}ele')
+        eles.append(float(ele_el.text) if ele_el is not None else 0.0)
+        lats.append(lat)
+        lons.append(lon)
+
+    if len(lats) < 2:
+        return None
+
+    distances = [0.0]
+    for i in range(1, len(lats)):
+        distances.append(distances[-1] + haversine(lats[i-1], lons[i-1], lats[i], lons[i]))
+
+    return eles, distances
 
 
-def HelperFunction(val):  # PEP8 Violation: Function name should be snake_case
-    """Unused helper function that violates naming convention"""
-    result=val*2  # PEP8 Violation: Missing spaces around operators
-    return result
+# ─────────────────────────────────────────────────────────────
+# DEMO ROUTE
+# ─────────────────────────────────────────────────────────────
+
+def demo_route():
+    """Synthetische 12 km hügelige Demo-Route."""
+    n = 300
+    t = np.linspace(0, 4 * math.pi, n)
+    eles = (250 + 100 * np.sin(t) + 25 * np.sin(5 * t)).tolist()
+    distances = np.linspace(0, 12, n).tolist()
+    return eles, distances
 
 
-# =============================================================================
-# DASH APPLICATION
-# =============================================================================
+# ─────────────────────────────────────────────────────────────
+# BERECHNUNGEN
+# ─────────────────────────────────────────────────────────────
 
-def create_dash_app():
-    """
-    Create and configure the Dash application.
-    
-    Returns:
-    --------
-    Dash
-        Configured Dash application instance
-    """
-    # Initialize the Dash app
-    app = Dash(__name__)
-    
-    # Define the layout
-    app.layout = html.Div([
-        html.H1("Road Profile Viewer with Camera Ray Intersection", 
-                style={'textAlign': 'center', 'color': '#2c3e50', 'marginBottom': '20px'}),
-        
-        html.Div([
-            html.Label("Camera Ray Angle (degrees from horizontal):", 
-                      style={'fontWeight': 'bold', 'marginRight': '10px'}),
-            dcc.Input(
-                id='angle-input',
-                type='number',
-                value=-1.1,
-                step=0.1,
-                style={'marginRight': '20px', 'padding': '5px', 'width': '100px'}
-            ),
-            html.Span(id='intersection-info', 
-                     style={'color': '#e74c3c', 'fontWeight': 'bold'})
-        ], style={'textAlign': 'center', 'marginBottom': '20px', 'padding': '10px'}),
-        
-        dcc.Graph(id='road-profile-graph', style={'height': '400px'}),
-        
-        html.Div([
-            html.H3("Instructions:", style={'color': '#2c3e50'}),
-            html.Ul([
-                html.Li("The dark grey line represents the road profile"),
-                html.Li("The red point at (0, 2.0) represents the camera position"),
-                html.Li("The blue line shows the camera ray at the specified angle"),
-                html.Li("The green point shows where the ray intersects the road"),
-                html.Li("Hover over the green point to see the distance from camera to intersection"),
-                html.Li("Adjust the angle to see how the intersection point changes"),
-                html.Li("Negative angles point downward, positive angles point upward")
-            ])
-        ], style={'margin': '20px', 'padding': '20px', 'backgroundColor': '#ecf0f1', 'borderRadius': '5px'})
-    ])
-    
-    # Define the callback to update the graph
-    @app.callback(
-        [Output('road-profile-graph', 'figure'),
-         Output('intersection-info', 'children')],
-        [Input('angle-input', 'value')]
-    )
-    def update_graph(angle):
-        """
-        Update the graph based on the input angle.
-        
-        Parameters:
-        -----------
-        angle : float
-            Camera ray angle in degrees
-            
-        Returns:
-        --------
-        tuple
-            (plotly figure, info text)
-        """
-        if angle is None:
-            angle = -1.1
-        
-        # Generate road profile  
-        x_road, y_road = generate_road_profile(num_points=100, x_max=80)
-        
-        # Camera position
-        camera_x,camera_y = 0,2.0  # PEP8 Violation: Missing spaces after commas
-        
-        # Find intersection first to determine ray length
-        x_intersect, y_intersect, distance = find_intersection(x_road, y_road, angle, camera_x, camera_y)
-        
-        # Calculate adaptive ray line based on intersection
-        if x_intersect is not None:
-            # Ray goes from camera to intersection point
-            x_ray = np.array([camera_x, x_intersect])
-            y_ray = np.array([camera_y, y_intersect])
+def elevation_stats(eles):
+    """Gibt (Aufstieg_m, Abstieg_m) zurück."""
+    gain = loss = 0.0
+    for i in range(1, len(eles)):
+        d = eles[i] - eles[i - 1]
+        if d > 0:
+            gain += d
         else:
-            # No intersection - show a short ray (20 units or to edge of plot)
-            angle_rad = -np.deg2rad(angle)
-            if np.abs(np.cos(angle_rad)) < 1e-10:
-                # Vertical line
-                x_ray = np.array([camera_x, camera_x])
-                y_ray = np.array([camera_y, camera_y - 10])
-            else:
-                slope = np.tan(angle_rad)
-                x_end = min(camera_x + 20, 80)
-                y_end = camera_y + slope * (x_end - camera_x)
-                x_ray = np.array([camera_x, x_end])
-                y_ray = np.array([camera_y, y_end])
-        
-        # Create figure
-        fig = go.Figure()
-        
-        # Add road profile
-        fig.add_trace(go.Scatter(
-            x=x_road,
-            y=y_road,
-            mode='lines+markers',
-            name='Road Profile',
-            line=dict(color='#4a4a4a', width=3),
-            marker=dict(size=4, color='#4a4a4a'),
-            hovertemplate='Road<br>x: %{x:.2f}<br>y: %{y:.2f}<extra></extra>'
-        ))
-        
-        # Add camera point
-        fig.add_trace(go.Scatter(
-            x=[camera_x],
-            y=[camera_y],
-            mode='markers',
-            name='Camera',
-            marker=dict(size=12,color='red',symbol='circle'),  # PEP8 Violation: Missing spaces after commas
-            hovertemplate='Camera<br>Position: (%{x:.2f}, %{y:.2f})<extra></extra>'
-        ))
-        
-        # Add camera ray - This is a very long comment that exceeds the recommended 79 character line length limit specified in PEP8 style guide
-        fig.add_trace(go.Scatter(
-            x=x_ray,
-            y=y_ray,
-            mode='lines',
-            name=f'Camera Ray ({angle}°)',
-            line=dict(color='blue', width=2, dash='dash'),
-            hovertemplate='Camera Ray<br>x: %{x:.2f}<br>y: %{y:.2f}<extra></extra>'
-        ))
-        
-        # Add intersection point if it exists
-        info_text = ""
-        if x_intersect is not None:
-            fig.add_trace(go.Scatter(
-                x=[x_intersect],
-                y=[y_intersect],
-                mode='markers',
-                name='Intersection',
-                marker=dict(size=15, color='green', symbol='star'),
-                hovertemplate=f'Intersection Point<br>Position: ({x_intersect:.2f}, {y_intersect:.2f})<br>Distance from camera: {distance:.2f}<extra></extra>'
-            ))
-            info_text = f"Intersection found at ({x_intersect:.2f}, {y_intersect:.2f}) | Distance: {distance:.2f} units"
-        else:
-            info_text = "No intersection found with current angle"
-        
-        # Update layout
-        fig.update_layout(
-            xaxis_title="X Position (m)",
-            yaxis_title="Y Position (m)",
-            hovermode='closest',
-            showlegend=True,
-            legend=dict(
-                x=1.02, 
-                y=1, 
-                xanchor='left',
-                yanchor='top',
-                bgcolor='rgba(255,255,255,0.8)',
-                bordercolor='#dee2e6',
-                borderwidth=1
-            ),
-            plot_bgcolor='#f8f9fa',
-            xaxis=dict(
-                gridcolor='#dee2e6', 
-                range=[-2, 82],
-                constrain='domain'
-            ),
-            yaxis=dict(
-                gridcolor='#dee2e6', 
-                scaleanchor='x', 
-                scaleratio=1,
-                range=[-0.5, 10],
-                constrain='domain'
-            ),
-            margin=dict(l=50, r=150, t=30, b=50)
+            loss -= d
+    return gain, loss
+
+
+def calories_cycling(weight_kg, distance_km, gain_m, speed_kmh=20):
+    """Kalorienverbrauch Fahrrad (MET-basiert)."""
+    time_h = distance_km / max(speed_kmh, 1)
+    base = 8.0 * weight_kg * time_h
+    climb = (gain_m / 100) * (weight_kg / 10) * 10
+    return base + climb
+
+
+def calories_running(weight_kg, distance_km, gain_m):
+    """Kalorienverbrauch Laufen."""
+    base = weight_kg * distance_km
+    climb = gain_m * 0.1 * (weight_kg / 70)
+    return base + climb
+
+
+def fuel_liters(distance_km, gain_m, loss_m, base_l100=7.0):
+    """Kraftstoffverbrauch in Litern. Bergauf mehr, bergab etwas weniger."""
+    base = distance_km * base_l100 / 100
+    extra = gain_m * 0.05 / 100
+    saved = loss_m * 0.01 / 100
+    return max(0.0, base + extra - saved)
+
+
+# ─────────────────────────────────────────────────────────────
+# DASH APP
+# ─────────────────────────────────────────────────────────────
+
+app = Dash(__name__)
+
+app.layout = html.Div([
+    html.H1("Route Analyzer"),
+
+    html.Div([
+        dcc.Upload(
+            id='gpx-upload',
+            children=html.Button("GPX Datei hochladen"),
+            accept='.gpx',
+        ),
+        html.Button("Demo Route", id='demo-btn', n_clicks=0,
+                    style={'marginLeft': '10px'}),
+        html.Span(id='file-info', style={'marginLeft': '10px', 'color': 'grey'}),
+    ]),
+
+    html.Div([
+        html.Label("Modus:"),
+        dcc.RadioItems(
+            id='mode',
+            options=[
+                {'label': ' Fahrrad', 'value': 'bike'},
+                {'label': ' Laufen',  'value': 'run'},
+                {'label': ' Auto',    'value': 'car'},
+            ],
+            value='bike',
+            inline=True,
+            style={'display': 'inline-block', 'marginLeft': '10px'},
+        ),
+    ], style={'marginTop': '15px'}),
+
+    html.Div(id='person-inputs', children=[
+        html.Label("Gewicht (kg):"),
+        dcc.Input(id='weight', type='number', value=75, min=30, max=200,
+                  style={'width': '80px', 'marginLeft': '5px'}),
+        html.Label(" Geschwindigkeit (km/h):", style={'marginLeft': '15px'}),
+        dcc.Input(id='speed', type='number', value=20, min=5, max=60,
+                  style={'width': '80px', 'marginLeft': '5px'}),
+    ], style={'marginTop': '10px'}),
+
+    html.Div(id='car-inputs', children=[
+        html.Label("Verbrauch (L/100km):"),
+        dcc.Input(id='fuel-base', type='number', value=7.0, min=3, max=30, step=0.5,
+                  style={'width': '80px', 'marginLeft': '5px'}),
+    ], style={'marginTop': '10px', 'display': 'none'}),
+
+    dcc.Store(id='route-data'),
+
+    dcc.Graph(id='elevation-chart', style={'marginTop': '20px'}),
+
+    html.Div(id='results', style={'marginTop': '20px', 'fontSize': '18px'}),
+])
+
+
+@app.callback(
+    Output('person-inputs', 'style'),
+    Output('car-inputs', 'style'),
+    Input('mode', 'value'),
+)
+def toggle_inputs(mode):
+    show = {'marginTop': '10px'}
+    hide = {'marginTop': '10px', 'display': 'none'}
+    if mode == 'car':
+        return hide, show
+    return show, hide
+
+
+@app.callback(
+    Output('route-data', 'data'),
+    Output('file-info', 'children'),
+    Input('gpx-upload', 'contents'),
+    Input('demo-btn', 'n_clicks'),
+    State('gpx-upload', 'filename'),
+    prevent_initial_call=True,
+)
+def load_route(contents, n_clicks, filename):
+    if ctx.triggered_id == 'demo-btn':
+        eles, distances = demo_route()
+        return {'eles': eles, 'distances': distances}, "Demo Route (12 km)"
+
+    if contents is None:
+        return None, ""
+
+    _, content_string = contents.split(',')
+    xml_bytes = base64.b64decode(content_string)
+    result = parse_gpx(xml_bytes.decode('utf-8', errors='replace'))
+    if result is None:
+        return None, "Fehler beim Lesen der GPX Datei."
+    eles, distances = result
+    return {'eles': eles, 'distances': distances}, f"{filename} geladen ({distances[-1]:.1f} km)"
+
+
+@app.callback(
+    Output('elevation-chart', 'figure'),
+    Output('results', 'children'),
+    Input('route-data', 'data'),
+    Input('mode', 'value'),
+    Input('weight', 'value'),
+    Input('speed', 'value'),
+    Input('fuel-base', 'value'),
+)
+def update_chart(data, mode, weight, speed, fuel_base):
+    if data is None:
+        empty = go.Figure()
+        empty.update_layout(
+            title="Keine Route geladen — GPX hochladen oder Demo Route klicken",
+            xaxis_title="Distanz (km)",
+            yaxis_title="Höhe (m)",
         )
-        
-        return fig, info_text
-    
-    return app
+        return empty, ""
 
+    eles = data['eles']
+    distances = data['distances']
+    gain, loss = elevation_stats(eles)
+    total_km = distances[-1]
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=distances,
+        y=eles,
+        fill='tozeroy',
+        mode='lines',
+        name='Höhenprofil',
+        line=dict(color='#2196F3', width=2),
+        hovertemplate='%{x:.2f} km | %{y:.0f} m<extra></extra>',
+    ))
+    fig.update_layout(
+        title=f"Höhenprofil — {total_km:.1f} km | +{gain:.0f} m / -{loss:.0f} m",
+        xaxis_title="Distanz (km)",
+        yaxis_title="Höhe (m)",
+        hovermode='x unified',
+    )
+
+    weight = weight or 75
+    speed = speed or 20
+    fuel_base = fuel_base or 7.0
+
+    if mode == 'bike':
+        kcal = calories_cycling(weight, total_km, gain, speed)
+        lines = [
+            html.B("Fahrrad"), html.Br(),
+            f"Distanz: {total_km:.1f} km", html.Br(),
+            f"Höhengewinn: {gain:.0f} m  |  Höhenverlust: {loss:.0f} m", html.Br(),
+            f"Kalorienverbrauch: {kcal:.0f} kcal", html.Br(),
+            f"Geschätzte Zeit: {total_km / speed * 60:.0f} min",
+        ]
+    elif mode == 'run':
+        kcal = calories_running(weight, total_km, gain)
+        lines = [
+            html.B("Laufen"), html.Br(),
+            f"Distanz: {total_km:.1f} km", html.Br(),
+            f"Höhengewinn: {gain:.0f} m  |  Höhenverlust: {loss:.0f} m", html.Br(),
+            f"Kalorienverbrauch: {kcal:.0f} kcal", html.Br(),
+            f"Geschätzte Zeit: {total_km / speed * 60:.0f} min",
+        ]
+    else:
+        liters = fuel_liters(total_km, gain, loss, fuel_base)
+        lines = [
+            html.B("Auto"), html.Br(),
+            f"Distanz: {total_km:.1f} km", html.Br(),
+            f"Höhengewinn: {gain:.0f} m  |  Höhenverlust: {loss:.0f} m", html.Br(),
+            f"Kraftstoffverbrauch: {liters:.2f} L", html.Br(),
+            f"Eff. Verbrauch: {liters / total_km * 100:.1f} L/100km",
+        ]
+
+    return fig, lines
+
 
 def main():
-    """
-    Main function to run the Dash application.
-    """
-    app = create_dash_app()
-    print("Starting Road Profile Viewer...")
-    print("Open your browser and navigate to: http://127.0.0.1:8050/")
-    print("Press Ctrl+C to stop the server.")
+    print("Route Analyzer läuft auf http://127.0.0.1:8050/")
     app.run(debug=True)
 
 
