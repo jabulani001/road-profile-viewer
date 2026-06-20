@@ -4,8 +4,8 @@ Route Analyzer - Höhenprofil, Kalorien & Kraftstoffverbrauch
 
 import base64
 import math
-import xml.etree.ElementTree as ET
 
+import defusedxml.ElementTree as ET
 import numpy as np
 from dash import Dash, html, dcc, Input, Output, State, ctx
 import plotly.graph_objects as go
@@ -26,7 +26,7 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def parse_gpx(xml_string):
-    """GPX-XML parsen, gibt (eles, distances_km) zurück oder None."""
+    """GPX-XML parsen, gibt (eles, distances_km, lats, lons) zurück oder None."""
     try:
         root = ET.fromstring(xml_string)
     except ET.ParseError:
@@ -47,7 +47,11 @@ def parse_gpx(xml_string):
         except (TypeError, ValueError):
             continue
         ele_el = pt.find(f'{prefix}ele')
-        eles.append(float(ele_el.text) if ele_el is not None else 0.0)
+        try:
+            ele = float(ele_el.text) if ele_el is not None else 0.0
+        except (TypeError, ValueError):
+            ele = 0.0
+        eles.append(ele)
         lats.append(lat)
         lons.append(lon)
 
@@ -58,7 +62,7 @@ def parse_gpx(xml_string):
     for i in range(1, len(lats)):
         distances.append(distances[-1] + haversine(lats[i-1], lons[i-1], lats[i], lons[i]))
 
-    return eles, distances
+    return eles, distances, lats, lons
 
 
 # ─────────────────────────────────────────────────────────────
@@ -66,12 +70,12 @@ def parse_gpx(xml_string):
 # ─────────────────────────────────────────────────────────────
 
 def demo_route():
-    """Synthetische 12 km hügelige Demo-Route."""
+    """Synthetische 12 km hügelige Demo-Route (keine GPS-Koordinaten)."""
     n = 300
     t = np.linspace(0, 4 * math.pi, n)
     eles = (250 + 100 * np.sin(t) + 25 * np.sin(5 * t)).tolist()
     distances = np.linspace(0, 12, n).tolist()
-    return eles, distances
+    return eles, distances, [], []
 
 
 # ─────────────────────────────────────────────────────────────
@@ -167,6 +171,8 @@ app.layout = html.Div([
 
     dcc.Graph(id='elevation-chart', style={'marginTop': '20px'}),
 
+    dcc.Graph(id='map-chart', style={'marginTop': '10px'}),
+
     html.Div(id='results', style={'marginTop': '20px', 'fontSize': '18px'}),
 ])
 
@@ -194,23 +200,31 @@ def toggle_inputs(mode):
 )
 def load_route(contents, n_clicks, filename):
     if ctx.triggered_id == 'demo-btn':
-        eles, distances = demo_route()
-        return {'eles': eles, 'distances': distances}, "Demo Route (12 km)"
+        eles, distances, lats, lons = demo_route()
+        return {'eles': eles, 'distances': distances, 'lats': lats, 'lons': lons}, "Demo Route (12 km)"
 
     if contents is None:
         return None, ""
 
-    _, content_string = contents.split(',')
-    xml_bytes = base64.b64decode(content_string)
-    result = parse_gpx(xml_bytes.decode('utf-8', errors='replace'))
+    try:
+        _, content_string = contents.split(',', 1)
+        xml_bytes = base64.b64decode(content_string)
+        result = parse_gpx(xml_bytes.decode('utf-8', errors='replace'))
+    except Exception:
+        return None, "Fehler beim Lesen der GPX Datei."
+
     if result is None:
         return None, "Fehler beim Lesen der GPX Datei."
-    eles, distances = result
-    return {'eles': eles, 'distances': distances}, f"{filename} geladen ({distances[-1]:.1f} km)"
+    eles, distances, lats, lons = result
+    return (
+        {'eles': eles, 'distances': distances, 'lats': lats, 'lons': lons},
+        f"{filename} geladen ({distances[-1]:.1f} km)"
+    )
 
 
 @app.callback(
     Output('elevation-chart', 'figure'),
+    Output('map-chart', 'figure'),
     Output('results', 'children'),
     Input('route-data', 'data'),
     Input('mode', 'value'),
@@ -218,7 +232,7 @@ def load_route(contents, n_clicks, filename):
     Input('speed', 'value'),
     Input('fuel-base', 'value'),
 )
-def update_chart(data, mode, weight, speed, fuel_base):
+def update_charts(data, mode, weight, speed, fuel_base):
     if data is None:
         empty = go.Figure()
         empty.update_layout(
@@ -226,15 +240,18 @@ def update_chart(data, mode, weight, speed, fuel_base):
             xaxis_title="Distanz (km)",
             yaxis_title="Höhe (m)",
         )
-        return empty, ""
+        return empty, go.Figure(), ""
 
     eles = data['eles']
     distances = data['distances']
+    lats = data.get('lats', [])
+    lons = data.get('lons', [])
     gain, loss = elevation_stats(eles)
-    total_km = distances[-1]
+    total_km = max(distances[-1], 0.001)
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
+    # Elevation chart
+    elev_fig = go.Figure()
+    elev_fig.add_trace(go.Scatter(
         x=distances,
         y=eles,
         fill='tozeroy',
@@ -243,13 +260,51 @@ def update_chart(data, mode, weight, speed, fuel_base):
         line=dict(color='#2196F3', width=2),
         hovertemplate='%{x:.2f} km | %{y:.0f} m<extra></extra>',
     ))
-    fig.update_layout(
+    elev_fig.update_layout(
         title=f"Höhenprofil — {total_km:.1f} km | +{gain:.0f} m / -{loss:.0f} m",
         xaxis_title="Distanz (km)",
         yaxis_title="Höhe (m)",
         hovermode='x unified',
     )
 
+    # Map chart
+    if lats and lons:
+        center_lat = sum(lats) / len(lats)
+        center_lon = sum(lons) / len(lons)
+        map_fig = go.Figure(go.Scattermapbox(
+            lat=lats,
+            lon=lons,
+            mode='lines+markers',
+            marker=dict(
+                size=5,
+                color=eles,
+                colorscale='RdYlGn',
+                reversescale=True,
+                colorbar=dict(title='Höhe (m)'),
+            ),
+            line=dict(width=3, color='#2196F3'),
+            hovertemplate='%{lat:.5f}, %{lon:.5f}<extra></extra>',
+            name='Route',
+        ))
+        map_fig.update_layout(
+            mapbox=dict(
+                style='open-street-map',
+                center=dict(lat=center_lat, lon=center_lon),
+                zoom=12,
+            ),
+            margin=dict(l=0, r=0, t=30, b=0),
+            title='Route auf Karte (Farbe = Höhe)',
+            height=450,
+        )
+    else:
+        map_fig = go.Figure()
+        map_fig.update_layout(
+            title='Karte nur mit GPX-Upload verfügbar (Demo hat keine GPS-Koordinaten)',
+            height=80,
+            margin=dict(t=30, b=0),
+        )
+
+    # Results
     weight = weight or 75
     speed = speed or 20
     fuel_base = fuel_base or 7.0
@@ -282,7 +337,7 @@ def update_chart(data, mode, weight, speed, fuel_base):
             f"Eff. Verbrauch: {liters / total_km * 100:.1f} L/100km",
         ]
 
-    return fig, lines
+    return elev_fig, map_fig, lines
 
 
 def main():
