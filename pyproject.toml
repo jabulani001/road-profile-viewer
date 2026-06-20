@@ -1,7 +1,7 @@
 [project]
-name = "road-profile-viewer"
+name = "route-analyzer"
 version = "0.1.0"
-description = "Interactive 2D road profile viewer with camera ray intersection using Dash and Plotly"
+description = "Route analyzer with elevation profile, calorie tracker and fuel consumption calculator"
 readme = "README.md"
 authors = [
     { name = "jabulani001", email = "albanleci5@gmail.com" }
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-road-profile-viewer = "road_profile_viewer:main"
+route-analyzer = "road_profile_viewer.main:main"
 
 [build-system]
 requires = ["uv_build>=0.8.19,<0.9.0"]
